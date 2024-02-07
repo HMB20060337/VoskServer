@@ -1,103 +1,173 @@
-from vosk import Model, KaldiRecognizer, SetLogLevel
 import os
-import json
-from pytube import YouTube
-from pydub import AudioSegment
-import subprocess
-from language_tool_python import LanguageTool
-import torchaudio
-
-from flask import Flask, request, jsonify
-
-from transformers import AutoTokenizer, MarianMTModel
-
-import torch
-from TTS.api import TTS
-import re
-from deepmultilingualpunctuation import PunctuationModel
-
-SetLogLevel(0)
-
+# Flask paketini kurun ve bir app nesnesi oluşturun
+from flask import Flask, request, send_file
 app = Flask(__name__)
 
-# Get device
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# Bir route fonksiyonu tanımlayın ve isteği argüman olarak alın
+@app.route("/dub", methods=["GET"])
+def dub():
+    # İsteğin bir YouTube video linki olduğunu doğrulayın
+    url = request.args.get("url")
+    if not url or not url.startswith("https://www.youtube.com/"):
+        return "Geçersiz URL"
 
-# Set up Vosk model
-model = Model('assets/models/vosk-model-en-us-0.22')
+    # İsteği youtube_dl paketi ile işleyin ve videoyu indirin
+    from pytube import YouTube
+
+    yt = YouTube(url)
+    stream = yt.streams.first()
+    stream.download(output_path='downloads', filename='video.mp4')
+
+    # Videoyu ses ve görüntü olarak ayırın
+    # ffmpeg -i video.mp4 -c:v copy -an video_only.mp4
+    # ffmpeg -i video.wav -c:a copy -vn audio_only.wav
+    # Subprocess modülünü içe aktarın
+    import subprocess
+    # Ffmpeg komutlarını birer liste olarak oluşturun
+    command1 = ["ffmpeg", "-i", "downloads/video.mp4", "-c:v", "copy", "-an", "video_only.mp4","-y"]
+
+    # Subprocess.run fonksiyonunu kullanarak, komut listelerini çalıştırın
+    subprocess.run(command1)
 
 
-# Initialize TTS model
-print("Model yükleniyor...")
-tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to('cpu')
-tokenizer = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-tc-big-en-tr")
-TranslateModel = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-tc-big-en-tr")
+    # Ses dosyasını Vosk ile transkribe edin ve altyazı dosyası olarak kaydedin
+    # Bu adımı daha önce yaptıysanız atlayabilirsiniz
+    from vosk import Model, KaldiRecognizer
+    import wave
+    import json
 
-punctuationModel = PunctuationModel()
+    model = Model('assets/models/vosk-model-en-us-0.22')
+    rec = KaldiRecognizer(model, 8000)
+    rec.SetWords(True)
 
-tool = LanguageTool('en-US')
+    subtitles = []
+    start = 0
+    end = 0
+    text = ""
+    with subprocess.Popen(["ffmpeg", "-loglevel", "quiet", "-i",
+                            "downloads/video.mp4",
+                            "-ar", str(8000) , "-ac", "1", "-f", "s16le", "-"],
+                            stdout=subprocess.PIPE).stdout as stream:
+        with open("subtitles.srt", "w") as f:
+            f.write(rec.SrtResult(stream))
 
-# API endpoint
-@app.route('/reverse', methods=['POST'])
-def reverse_text():
-    # Get the request data
-    data = request.get_json()
-    # Get the YouTube URL and download the audio
-    youtube_url = data.get('url')
-    yt = YouTube(youtube_url)
-    stream = yt.streams.filter(only_audio=True).first()
-    stream.download(output_path='downloads', filename='audio.mp4')
+    # Altyazı dosyasını LanguageTool ile düzeltin
+    from language_tool_python import LanguageTool
+    tool = LanguageTool('en-US')
+    with open("subtitles.srt", "r") as f:
+        lines = f.readlines()
+    with open("subtitles_corrected.srt", "w") as f:
+        for line in lines:
+            if line.strip().isdigit() or "-->" in line.strip():
+                f.write(line)
+            elif line.strip():
+                if(tool.check(line)):
+                    corrected = tool.correct(line)
+                    f.write(corrected + "\n")
+            else:
+                f.write("\n")
 
-    # Convert audio to WAV format
-    audio_path = 'downloads/audio.mp4'
-    sound = AudioSegment.from_file(audio_path, format='mp4')
-    sound.export('downloads/audio.wav', format='wav')
+    # Altyazı dosyasına punctuationmodel ile noktalama işaretleri ekleyin
+    from deepmultilingualpunctuation import PunctuationModel
+    model = PunctuationModel()
+    with open("subtitles_corrected.srt", "r") as f:
+        lines = f.readlines()
+    with open("subtitles_punctuated.srt", "w") as f:
+        for line in lines:
+            if line.strip().isdigit() or "-->" in line.strip():
+                f.write(line)
+            elif line.strip():
+                punctuated = model.restore_punctuation(line)
+                f.write(punctuated + "\n")
+            else:
+                f.write("\n")
 
-    # Perform speech recognition and translation
-    text = ''
-    rec = KaldiRecognizer(model, 16000)
-    with subprocess.Popen(["ffmpeg", "-loglevel", "quiet", "-i", 'downloads/audio.wav', "-ar", str(16000) , "-ac", "1", "-f", "s16le", "-"], stdout=subprocess.PIPE) as process:
-        outputCounter = 1
-        while True:
-            data = process.stdout.read(4000)
-            if len(data) == 0:
-                break
-            if rec.AcceptWaveform(data):
-                res = json.loads(rec.Result())
-                text += res['text'] + " "
-    tool_results = tool.correct(text)
-    result = punctuationModel.restore_punctuation(tool_results)
-    print('****--'+result+'--****')
-    sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s', result)
-    output_counter=1
-    respond = ''
-    maksimum_karakter_sayisi = 220
+    # Altyazı dosyasını çeviri modeli ile Türkçe'ye çevirin
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    tokenizer = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-tatoeba-en-tr")
+    model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-tatoeba-en-tr")
+    with open("subtitles_punctuated.srt", "r") as f:
+        lines = f.readlines()
+    with open("subtitles_translated.srt", "w") as f:
+        for line in lines:
+            if line.strip().isdigit() or "-->" in line.strip():
+                f.write(line)
+            elif line.strip():
+                inputs = tokenizer.encode(line, return_tensors="pt")
+                outputs = model.generate(inputs, max_length=40, num_beams=4, early_stopping=True)
+                translated = tokenizer.decode(outputs[0],skip_special_tokens=True)
+                f.write(translated + "\n")
+            else:
+                f.write("\n")
 
-    split_sentences = []
+    # Altyazı dosyasını coqui ai tts ile seslendirin ve ses dosyaları olarak kaydedin
+    import os
+    import torch
+    import torchaudio
+    from TTS.tts.configs.xtts_config import XttsConfig
+    from TTS.tts.models.xtts import Xtts
 
-    gecici_metin = ""
-    for sentence in sentences:
-    # Eğer geçici metin ile bu cümlenin toplam karakter sayısı maksimum sınırdan küçükse
-        if len(gecici_metin) + len(sentence) <= maksimum_karakter_sayisi:
-        # Geçici metne cümleyi ekle
-            gecici_metin += sentence + " "
+    config = XttsConfig()
+    config.load_json("assets/tts_models--multilingual--multi-dataset--xtts_v2/config.json")
+    model = Xtts.init_from_config(config)
+    model.load_checkpoint(config, checkpoint_dir="assets/tts_models--multilingual--multi-dataset--xtts_v2/")
+    model.cuda()
+    command3args = []
+    offsets = []
+    gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(audio_path=["assets/sample_wav_for_copy/r.wav"])
+    def get_wav_duration(file_path):
+    # WAV dosyasını aç
+        with wave.open(file_path, 'rb') as wav_file:
+        # Dosyanın uzunluğunu saniye cinsinden al
+            duration_in_secs = wav_file.getnframes() / wav_file.getframerate()
+        return duration_in_secs*1000
+    import shutil
+    shutil.rmtree(os.getcwd()+"\outputs")
+    os.mkdir(os.getcwd()+"/outputs")
+    with open("subtitles_translated.srt", "r") as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        if "-->" in line.strip():
+            times = line.split(" --> ")
+            import datetime
+            time = datetime.datetime.strptime(times[0], "%H:%M:%S,%f")
+            offsets.append(time.hour*3600+time.minute*60+time.second+time.microsecond/1000000)
+        elif line.strip() and not line.strip().isdigit() and not "-->" in line.strip():
+            out = model.inference(
+                line,
+                "tr",
+                gpt_cond_latent,
+                speaker_embedding,
+                temperature=0.8, # Sesin doğallığını artırır
+                speed=1.2 # Sesin hızını artırır
+            )
+            torchaudio.save(f"outputs/output{i}.wav", torch.tensor(out["wav"]).unsqueeze(0), 24000,encoding="PCM_S", bits_per_sample=16)
+            command3args.append(f"-i") # -i seçeneğini listeye ekle
+            command3args.append(f"outputs/output{i}.wav") # ses dosyasının adını listeye ekle
+    command3args.append("-filter_complex")
+    output_folder = "outputs"
+    args=''
+    outputs = os.listdir(output_folder)
+    outputs = sorted(outputs, key=lambda x: int(x[6:-4]))
+    for x in range(len(outputs)):
+        if (x==0):
+            args += f'[{x+1}:a]adelay={int(offsets[x]*1000)}|{int(offsets[x]*1000)}[a{x+1}];'
         else:
-        # Geçici metni parçalara böl ve listeye ekle
-            split_sentences.append(gecici_metin.strip())
-        # Yeni bir geçici metin başlat
-            gecici_metin = sentence + " "
-    
-    split_sentences.append(gecici_metin.strip())
-
-    for sentence in split_sentences:
-        inputs = tokenizer(sentence, return_tensors="pt")
-        translation = TranslateModel.generate(**inputs)
-        tr = tokenizer.batch_decode(translation, skip_special_tokens=True)
-        respond = respond+' '+tr[0]
-        print("Ses üretiliyor... "+f"output{output_counter}.wav")
-        tts.tts_to_file(text=tr[0], speaker_wav="assets/r.wav", language="tr", file_path=f"output{output_counter}.wav")
-        output_counter+=1
-    return jsonify({'text': respond})
+            off= get_wav_duration("outputs/"+outputs[x-1])
+            args += f'[{x+1}:a]adelay={int(off)+int(offsets[x-1]*1000)}|{int(off)+int(offsets[x-1]*1000)}[a{x+1}];'
+    for x in range(len(os.listdir(output_folder))):
+        args += f'[a{x+1}]'
+    command3args.append(args+f"amix=inputs={len(os.listdir(output_folder))}[a]")
+    command3args.append("-map")
+    command3args.append("0:v")
+    command3args.append("-map")
+    command3args.append("[a]")
+    command3 = ["ffmpeg", "-i", "video_only.mp4"]+command3args+["-c:v","libx264","output.mp4","-y"]
+    print(command3)
+    subprocess.call(command3)
+    # Ses dosyalarını videoya ekleyin ve dublajlı videoyu oluşturun
+    # ffmpeg -i video_only.mp4 -i audio-*.wav -c:v
+    return send_file("output.mp4", as_attachment=True)
 
 if __name__ == '__main__':
     app.run(debug=True)

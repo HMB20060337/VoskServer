@@ -1,1 +1,3 @@
-assets/models
+assets/models/
+assets/tts_models--multilingual--multi-dataset--xtts_v2/
+assets/sample_wav_for_copy/
